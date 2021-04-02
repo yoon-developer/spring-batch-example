@@ -300,9 +300,166 @@ spring:
 Step A  ->   (YES)  - > STEP B  
 Step A  ->   (NO)   - > STEP C 
 
+```java
+@RequiredArgsConstructor
+@Configuration
+public class StepNextConditionalJobConfiguration {
 
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
 
+  @Bean
+  public Job stepNextConditionalJob() {
+    return jobBuilderFactory.get("stepNextConditionalJob")
+        .start(conditionalJobStep1()) // ~ STEP 실행 
+          .on("FAILED") // ~ STEP ExitStatus 결과가 ~ 일 경우
+          .to(conditionalJobStep3()) // ~ STEP 실행
+          .on("*")  // ~ STEP ExitStatus 결과가 ~ 일 경우
+          .end() // STEP 종료
+        .from(conditionalJobStep1()) // ~ STEP 실행
+          .on("*") // ~ STEP ExitStatus 결과가 ~ 일 경우
+          .to(conditionalJobStep2()) // ~ STEP 실행
+          .next(conditionalJobStep3()) // 정상 종료될 경우 ~ STEP 실행
+          .on("*") // ~ STEP ExitStatus 결과가 ~ 일 경우
+          .end() // STEP 종료
+        .end() // JOB 종료
+        .build();
+  }
 
+  @Bean
+  public Step conditionalJobStep1() {
+    return stepBuilderFactory.get("step1")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> This is stepNextConditionalJob Step1");
 
+          contribution.setExitStatus(ExitStatus.FAILED);
 
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+
+  @Bean
+  public Step conditionalJobStep2() {
+    return stepBuilderFactory.get("conditionalJobStep2")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> This is stepNextConditionalJob Step2");
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+
+  @Bean
+  public Step conditionalJobStep3() {
+    return stepBuilderFactory.get("conditionalJobStep3")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> This is stepNextConditionalJob Step3");
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+}
+```
+
+## 4.1. Batch Status
+
+Job 또는 Step 의 실행 결과를 Spring에서 기록할 때 사용하는 Enum
+- COMPLETED
+- STARTING
+- STARTED
+- STOPPING
+- STOPPED
+- FAILED
+- ABANDONED
+- UNKNOWN
+
+## 4.2. Exit Status
+ 
+Step의 실행 후 상태
+- EXECUTING
+- COMPLETED
+- NOOP
+- FAILED
+- STOPPED
+
+## 4.3. Decide
+
+- FlowExecutionStatus: 상태 관리
+
+```java
+@Slf4j
+@Configuration
+@RequiredArgsConstructor
+public class DeciderJobConfiguration {
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+
+  @Bean
+  public Job deciderJob() {
+    return jobBuilderFactory.get("deciderJob")
+        .start(startStep())
+        .next(decider()) // ~ METHOD 실행
+          .from(decider()) 
+          .on("ODD") // ~ METHOD 실행 상태가 ~~ 일 경우
+          .to(oddStep()) // STEP 실행
+        .from(decider())
+          .on("EVEN") // ~ METHOD 실행 상태가 ~~ 일 경우
+          .to(evenStep()) // STEP 실행 
+        .end()
+        .build();
+  }
+
+  @Bean
+  public Step startStep() {
+    return stepBuilderFactory.get("startStep")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> Start!");
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+
+  @Bean
+  public Step evenStep() {
+    return stepBuilderFactory.get("evenStep")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> 짝수입니다.");
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+
+  @Bean
+  public Step oddStep() {
+    return stepBuilderFactory.get("oddStep")
+        .tasklet((contribution, chunkContext) -> {
+          log.info(">>>>> 홀수입니다.");
+          return RepeatStatus.FINISHED;
+        })
+        .build();
+  }
+
+  @Bean
+  public JobExecutionDecider decider() {
+    return new OddDecider();
+  }
+
+  public static class OddDecider implements JobExecutionDecider {
+
+    @Override
+    public FlowExecutionStatus decide(JobExecution jobExecution, StepExecution stepExecution) {
+      Random rand = new Random();
+
+      int randomNumber = rand.nextInt(50) + 1;
+      log.info("랜덤숫자: {}", randomNumber);
+
+      if(randomNumber % 2 == 0) {
+        return new FlowExecutionStatus("EVEN");
+      } else {
+        return new FlowExecutionStatus("ODD");
+      }
+    }
+  }
+}
+```
 
