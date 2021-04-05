@@ -566,3 +566,386 @@ public class JobLauncherController {
 
 }
 ```
+
+# 6. Chunk 지향 처리
+- Chunk: 데이터 덩어리로 작업 할 때 각 커밋 사이에 처리되는 row 수.
+- Chunk 지향 처리: 한 번에 하나씩 데이터를 읽어 Chunk라는 덩어리를 만든 뒤, Chunk 단위로 트랜잭션을 다루는 것
+- 실패할 경우엔 해당 Chunk 만큼만 롤백
+
+> Chunk 지향 처리를 Java 코드로 표현
+
+모든 Item 에서 Read, Process 작업이 이루어진후, 마지막에 모든 Item 을 Write 
+
+```java
+for(int i=0; i<totalSize; i+=chunkSize){
+    List items = new Arraylist();
+    for(int j = 0; j < chunkSize; j++){
+        Object item = itemReader.read()
+        Object processedItem = itemProcessor.process(item);
+        items.add(processedItem);
+    }
+    itemWriter.write(items);
+}
+```
+
+## 6.1. ChunkOrientedTasklet
+
+> ChunkOrientedTasklet Class
+- chunkProvider.provide(): Reader 에서 Chunk size만큼 데이터 읽음(Read)
+- chunkProcessor.process(): Reader로 받은 데이터를 가공(Processor)하고 저장(Writer)
+
+```java
+@Nullable
+@Override
+public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+
+	@SuppressWarnings("unchecked")
+	Chunk<I> inputs = (Chunk<I>) chunkContext.getAttribute(INPUTS_KEY);
+	if (inputs == null) {
+		inputs = chunkProvider.provide(contribution);
+		if (buffering) {
+			chunkContext.setAttribute(INPUTS_KEY, inputs);
+		}
+	}
+
+	chunkProcessor.process(contribution, inputs);
+	chunkProvider.postProcess(contribution, inputs);
+
+	// Allow a message coming back from the processor to say that we
+	// are not done yet
+	if (inputs.isBusy()) {
+		logger.debug("Inputs still busy");
+		return RepeatStatus.CONTINUABLE;
+	}
+
+	chunkContext.removeAttribute(INPUTS_KEY);
+	chunkContext.setComplete();
+
+	if (logger.isDebugEnabled()) {
+		logger.debug("Inputs not busy, ended: " + inputs.isEnd());
+	}
+	return RepeatStatus.continueIf(!inputs.isEnd());
+
+}
+```
+
+> SimpleChunkProvider
+- repeatOperations.iterate: 반복 작업 수행
+- item = read(contribution, inputs): Reader.read()
+- inputs.add(item): 데이터 추기
+- Read 호출 순서: provide > read > doRead 
+
+```java
+	@Override
+public Chunk<I> provide(final StepContribution contribution) throws Exception {
+
+	final Chunk<I> inputs = new Chunk<>();
+	repeatOperations.iterate(new RepeatCallback() {
+
+		@Override
+		public RepeatStatus doInIteration(final RepeatContext context) throws Exception {
+			I item = null;
+			Timer.Sample sample = Timer.start(Metrics.globalRegistry);
+			String status = BatchMetrics.STATUS_SUCCESS;
+			try {
+				item = read(contribution, inputs);
+			}
+			catch (SkipOverflowException e) {
+				// read() tells us about an excess of skips by throwing an
+				// exception
+				status = BatchMetrics.STATUS_FAILURE;
+				return RepeatStatus.FINISHED;
+			}
+			finally {
+				stopTimer(sample, contribution.getStepExecution(), status);
+			}
+			if (item == null) {
+				inputs.setEnd();
+				return RepeatStatus.FINISHED;
+			}
+			inputs.add(item);
+			contribution.incrementReadCount();
+			return RepeatStatus.CONTINUABLE;
+		}
+
+	});
+
+	return inputs;
+
+}
+
+protected I read(StepContribution contribution, Chunk<I> chunk) throws SkipOverflowException, Exception {
+	return doRead();
+}
+
+@Nullable
+protected final I doRead() throws Exception {
+	try {
+		listener.beforeRead();
+		I item = itemReader.read();
+		if(item != null) {
+			listener.afterRead(item);
+		}
+		return item;
+	}
+	catch (Exception e) {
+		if (logger.isDebugEnabled()) {
+			logger.debug(e.getMessage() + " : " + e.getClass().getName());
+		}
+		listener.onReadError(e);
+		throw e;
+	}
+}
+```
+
+> 
+```java
+
+```
+
+## 6.2. SimpleChunkProcessor
+
+- Chunk<O> outputs = transform(contribution, inputs)
+  - inputs: chunkProvider.provide() 에서 받은 ChunkSize 만큼 쌓인 item
+- transform(): 전달받은 inputs을 doProcess()로 전달
+- transform()을 통해 가공된 대량의 데이터는 write()를 통해 일괄 저장
+
+```java
+@Override
+public final void process(StepContribution contribution, Chunk<I> inputs) throws Exception {
+
+	// Allow temporary state to be stored in the user data field
+	initializeUserData(inputs);
+
+	// If there is no input we don't have to do anything more
+	if (isComplete(inputs)) {
+		return;
+	}
+
+	// Make the transformation, calling remove() on the inputs iterator if
+	// any items are filtered. Might throw exception and cause rollback.
+	Chunk<O> outputs = transform(contribution, inputs);
+
+	// Adjust the filter count based on available data
+	contribution.incrementFilterCount(getFilterCount(inputs, outputs));
+
+	// Adjust the outputs if necessary for housekeeping purposes, and then
+	// write them out...
+	write(contribution, inputs, getAdjustedOutputs(inputs, outputs));
+
+}
+```
+
+> Chunk<O> outputs = transform(contribution, inputs)
+
+- doProcess(): 만약 ItemProcessor가 없다면 item을 그대로 반환하고 있다면 ItemProcessor의 process()로 가공하여 반환
+
+```java
+protected Chunk<O> transform(StepContribution contribution, Chunk<I> inputs) throws Exception {
+	Chunk<O> outputs = new Chunk<>();
+	for (Chunk<I>.ChunkIterator iterator = inputs.iterator(); iterator.hasNext();) {
+		final I item = iterator.next();
+		O output;
+		Timer.Sample sample = BatchMetrics.createTimerSample();
+		String status = BatchMetrics.STATUS_SUCCESS;
+		try {
+			output = doProcess(item);
+		}
+		catch (Exception e) {
+			/*
+			 * For a simple chunk processor (no fault tolerance) we are done
+			 * here, so prevent any more processing of these inputs.
+			 */
+			inputs.clear();
+			status = BatchMetrics.STATUS_FAILURE;
+			throw e;
+		}
+		finally {
+			stopTimer(sample, contribution.getStepExecution(), "item.process", status, "Item processing");
+		}
+		if (output != null) {
+			outputs.add(output);
+		}
+		else {
+			iterator.remove();
+		}
+	}
+	return outputs;
+}
+
+protected final O doProcess(I item) throws Exception {
+
+	if (itemProcessor == null) {
+		@SuppressWarnings("unchecked")
+		O result = (O) item;
+		return result;
+	}
+
+	try {
+		listener.beforeProcess(item);
+		O result = itemProcessor.process(item);
+		listener.afterProcess(item, result);
+		return result;
+	}
+	catch (Exception e) {
+		listener.onProcessError(item, e);
+		throw e;
+	}
+
+}
+```
+
+> write(contribution, inputs, getAdjustedOutputs(inputs, outputs))
+
+```java
+protected void write(StepContribution contribution, Chunk<I> inputs, Chunk<O> outputs) throws Exception {
+	Timer.Sample sample = BatchMetrics.createTimerSample();
+	String status = BatchMetrics.STATUS_SUCCESS;
+	try {
+		doWrite(outputs.getItems());
+	}
+	catch (Exception e) {
+		/*
+		 * For a simple chunk processor (no fault tolerance) we are done
+		 * here, so prevent any more processing of these inputs.
+		 */
+		inputs.clear();
+		status = BatchMetrics.STATUS_FAILURE;
+		throw e;
+	}
+	finally {
+		stopTimer(sample, contribution.getStepExecution(), "chunk.write", status, "Chunk writing");
+	}
+	contribution.incrementWriteCount(outputs.size());
+}
+
+protected final void doWrite(List<O> items) throws Exception {
+
+	if (itemWriter == null) {
+		return;
+	}
+
+	try {
+		listener.beforeWrite(items);
+		writeItems(items);
+		doAfterWrite(items);
+	}
+	catch (Exception e) {
+		doOnWriteError(e, items);
+		throw e;
+	}
+
+}
+
+```
+
+## 6.3. Page Size vs Chunk Size
+
+- Chunk Size: 한번에 처리될 트랜잭션 단위를
+- Page Size: 한번에 조회할 Item의 양
+
+AbstractItemCountingItemStreamItemReader Class
+
+```java
+@Nullable
+@Override
+public T read() throws Exception, UnexpectedInputException, ParseException {
+	if (currentItemCount >= maxItemCount) {
+		return null;
+	}
+	currentItemCount++;
+	T item = doRead();
+	if(item instanceof ItemCountAware) {
+		((ItemCountAware) item).setItemCount(currentItemCount);
+	}
+	return item;
+}
+```
+
+AbstractPagingItemReader class
+
+- doRead()에서는 현재 읽어올 데이터가 없거나, Page Size를 초과한 경우 doReadPage()를 호출 (Page 단위로 끊어서 조회)
+
+```java
+@Override
+protected T doRead() throws Exception {
+
+	synchronized (lock) {
+
+		if (results == null || current >= pageSize) {
+
+			if (logger.isDebugEnabled()) {
+				logger.debug("Reading page " + getPage());
+			}
+
+			doReadPage();
+			page++;
+			if (current >= pageSize) {
+				current = 0;
+			}
+
+		}
+
+		int next = current++;
+		if (next < results.size()) {
+			return results.get(next);
+		}
+		else {
+			return null;
+		}
+
+	}
+
+}
+```
+
+JpaPagingItemReader Class
+
+- .setFirstResult(getPage() * getPageSize()).setMaxResults(getPageSize()): Page만큼 추가 조회
+- results.addAll(query.getResultList()): 조회결과 results에 저장
+
+```java
+@Override
+@SuppressWarnings("unchecked")
+protected void doReadPage() {
+
+	EntityTransaction tx = null;
+		
+	if (transacted) {
+		tx = entityManager.getTransaction();
+		tx.begin();
+			
+		entityManager.flush();
+		entityManager.clear();
+	}//end if
+
+	Query query = createQuery().setFirstResult(getPage() * getPageSize()).setMaxResults(getPageSize());
+
+	if (parameterValues != null) {
+		for (Map.Entry<String, Object> me : parameterValues.entrySet()) {
+			query.setParameter(me.getKey(), me.getValue());
+		}
+	}
+
+	if (results == null) {
+		results = new CopyOnWriteArrayList<>();
+	}
+	else {
+		results.clear();
+	}
+		
+	if (!transacted) {
+		List<T> queryResult = query.getResultList();
+		for (T entity : queryResult) {
+			entityManager.detach(entity);
+			results.add(entity);
+		}//end if
+	} else {
+		results.addAll(query.getResultList());
+		tx.commit();
+	}//end if
+}
+```
+
+ex) PageSize가 10이고, ChunkSize가 50이라면 ItemReader에서 Page 조회가 5번 일어나면 1번 의 트랜잭션이 발생하여 Chunk가 처리
+- 한번의 트랜잭션 처리를 위해 5번의 쿼리 조회가 발생하기 때문에 성능상 이슈가 발생할생
