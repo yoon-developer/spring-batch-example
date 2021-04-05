@@ -463,3 +463,106 @@ public class DeciderJobConfiguration {
 }
 ```
 
+# 5. Spring Batch Scope & Job Parameter
+
+## 5.1. JobParameter와 Scope
+
+> JobScope
+
+Step 선언문에서 사용
+
+- .start(scopeStep1(null))
+- @JobScope 
+- scopeStep1
+
+```java
+@Bean
+public Job scopeJob() {
+  return jobBuilderFactory.get("simpleJob")
+      .start(scopeStep1(null))
+      .build();
+}
+
+@Bean
+@JobScope
+public Step scopeStep1(@Value("#{jobParameters[requestDate]}") String requestDate) {
+  return stepBuilderFactory.get("simpleStep1")
+      .tasklet(scopeStep1Tasklet(null))
+      .build();
+}
+```
+
+> StepScope
+
+Tasklet, ItemReader, ItemWriter, ItemProcessor 에서 사용
+
+- .tasklet(scopeStep1Tasklet(null))
+- scopeStep1Tasklet
+
+```java
+@Bean
+@JobScope
+public Step scopeStep1(@Value("#{jobParameters[requestDate]}") String requestDate) {
+  return stepBuilderFactory.get("simpleStep1")
+      .tasklet(scopeStep1Tasklet(null))
+      .build();
+}
+
+@Bean
+@StepScope
+public Tasklet scopeStep1Tasklet(@Value("#{jobParameters[requestDate]}") String requestDate) {
+  return ((contribution, chunkContext) -> {
+    log.info(">>>>> This is ScopeStep1Tasklet");
+    log.info(">>>>> requestDate = {}", requestDate);
+    return RepeatStatus.FINISHED;
+  });
+}
+```
+
+## 5.2. @StepScope & @JobScope 소개
+
+@JobScope, @StepScope 사용시 지연로딩
+
+> Spring Batch Scope 장점
+- JobParameter 의 Late Binding
+- 동일한 컴포넌트를 병렬 혹은 동시에 사용할 경우 (각각의 Step에서 별도의 Tasklet을 생성하고 관리)
+
+## 5.3. JobParameter vs 시스템 변수
+> 시스템 변수를 사용할 경우
+- Spring Batch에서 자동으로 관리해주는 Parameter 관련 메타 테이블을 관리하지 않음
+- 전역 상태 (시스템 변수 혹은 환경 변수)를 동적으로 계속해서 변경시킬 수 있도록 Spring Batch를 구성 해야함
+- Late Binding을 사용 하지 못함
+
+## 5.4. JobParameter Controller Example
+
+예제코드: Controller 에서 Spring Batch 사용을 권장하지 않음
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@RestController
+public class JobLauncherController {
+  
+  private final JobLauncher jobLauncher;
+  private final Job job;
+  
+  @GetMapping("/launchjob")
+  public String handle(@RequestParam("fileName") String fileName) throws Exception {
+    
+    try {
+      JobParameters jobParameter = new JobParametersBuilder()
+          .addString("input.file.name", fileName)
+          .addLong("time", System.currentTimeMillis())
+          .toJobParameters();
+      
+      jobLauncher.run(job, jobParameter);
+      
+    } catch (Exception e) {
+      log.error(e.getMessage());
+    }
+    
+    return "Done";
+  }
+
+}
+```
