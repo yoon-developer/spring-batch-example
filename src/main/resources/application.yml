@@ -8,14 +8,16 @@ spring:
   jpa:
     show-sql: true
     hibernate:
-      ddl-auto: create
+      ddl-auto: none
     generate-ddl: true
     properties:
       hibernate:
         format_sql: true
 
-
   batch:
     job:
-      names: ${job.name:deciderJob}
+      names: ${job.name:jdbcCursorItemReaderJob}
     initialize-schema: always
+logging:
+  level:
+    org.springframework.batch: DEBUG

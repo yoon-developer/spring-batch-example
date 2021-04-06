@@ -844,7 +844,7 @@ protected final void doWrite(List<O> items) throws Exception {
 - Chunk Size: 한번에 처리될 트랜잭션 단위를
 - Page Size: 한번에 조회할 Item의 양
 
-AbstractItemCountingItemStreamItemReader Class
+[ AbstractItemCountingItemStreamItemReader Class ]
 
 ```java
 @Nullable
@@ -862,7 +862,7 @@ public T read() throws Exception, UnexpectedInputException, ParseException {
 }
 ```
 
-AbstractPagingItemReader class
+[ AbstractPagingItemReader Class ] 
 
 - doRead()에서는 현재 읽어올 데이터가 없거나, Page Size를 초과한 경우 doReadPage()를 호출 (Page 단위로 끊어서 조회)
 
@@ -899,7 +899,7 @@ protected T doRead() throws Exception {
 }
 ```
 
-JpaPagingItemReader Class
+[ JpaPagingItemReader Class ]
 
 - .setFirstResult(getPage() * getPageSize()).setMaxResults(getPageSize()): Page만큼 추가 조회
 - results.addAll(query.getResultList()): 조회결과 results에 저장
@@ -948,4 +948,396 @@ protected void doReadPage() {
 ```
 
 ex) PageSize가 10이고, ChunkSize가 50이라면 ItemReader에서 Page 조회가 5번 일어나면 1번 의 트랜잭션이 발생하여 Chunk가 처리
-- 한번의 트랜잭션 처리를 위해 5번의 쿼리 조회가 발생하기 때문에 성능상 이슈가 발생할생
+- 한번의 트랜잭션 처리를 위해 5번의 쿼리 조회가 발생하기 때문에 성능상 이슈가 발생
+
+# 7. ItemReader
+
+## 7.1. ItemReader 설명
+> Spring Batch의 Chunk Tasklet 과정
+
+데이터(읽기) -> ItemReader -> ItemProcessor -> ItemWriter -> 데이터(쓰기)
+
+> Readerd에서 읽어올 수 있는 데이터 유형
+- 입력 데이터
+- 파일
+- Database
+- Java Message Service
+- Custom Reader
+
+> ItemReader 구현체
+
+[ ItemReader Interface ]
+
+- read(): 데이터를 읽어오는 메소드
+
+ ```java
+public interface ItemReader<T> {
+
+	/**
+	 * Reads a piece of input data and advance to the next one. Implementations
+	 * <strong>must</strong> return <code>null</code> at the end of the input
+	 * data set. In a transactional setting, caller might get the same item
+	 * twice from successive calls (or otherwise), if the first call was in a
+	 * transaction that rolled back.
+	 * 
+	 * @throws ParseException if there is a problem parsing the current record
+	 * (but the next one may still be valid)
+	 * @throws NonTransientResourceException if there is a fatal exception in
+	 * the underlying resource. After throwing this exception implementations
+	 * should endeavour to return null from subsequent calls to read.
+	 * @throws UnexpectedInputException if there is an uncategorised problem
+	 * with the input data. Assume potentially transient, so subsequent calls to
+	 * read might succeed.
+	 * @throws Exception if an there is a non-specific error.
+	 * @return T the item to be processed or {@code null} if the data source is
+	 * exhausted
+	 */
+	@Nullable
+	T read() throws Exception, UnexpectedInputException, ParseException, NonTransientResourceException;
+
+}
+```
+[ ItemStream Interface ]
+- 주기적으로 상태를 저장하고 오류가 발생하면 해당 상태에서 복원
+- ItemReader의 상태를 저장하고 실패한 곳에서 다시 실행할 수 있게 해주는 역할
+- open(), close(): 스트림을 열기, 닫기
+- update(): Batch 처리의 상태를 업데이트
+
+```java
+public interface ItemStream {
+
+	/**
+	 * Open the stream for the provided {@link ExecutionContext}.
+	 *
+	 * @param executionContext current step's {@link org.springframework.batch.item.ExecutionContext}.  Will be the
+	 *                            executionContext from the last run of the step on a restart.
+	 * @throws IllegalArgumentException if context is null
+	 */
+	void open(ExecutionContext executionContext) throws ItemStreamException;
+
+	/**
+	 * Indicates that the execution context provided during open is about to be saved. If any state is remaining, but
+	 * has not been put in the context, it should be added here.
+	 * 
+	 * @param executionContext to be updated
+	 * @throws IllegalArgumentException if executionContext is null.
+	 */
+	void update(ExecutionContext executionContext) throws ItemStreamException;
+
+	/**
+	 * If any resources are needed for the stream to operate they need to be destroyed here. Once this method has been
+	 * called all other methods (except open) may throw an exception.
+	 */
+	void close() throws ItemStreamException;
+}
+```
+
+ItemReader와 ItemStream 인터페이스를 직접 구현해서 원하는 형태의 ItemReader 구현 가능
+
+## 7.2. Database Reader
+- Cursor는 실제로 JDBC ResultSet의 기본 기능
+- ResultSet이 open 될 때마다 next() 메소드가 호출 되어 Database의 데이터가 반환
+- Paging: 페이지 단위로 한번에 데이터를 조회해오는 방식
+
+> Cursor와 Paging 비교
+
+- Database -> CursorItemReader(1Row)
+  - Cursor: Database와 커넥션을 맺은 후, Cursor를 한칸씩 옮기면서 지속적으로 데이터 Read
+
+- Database -> PagingItemReader(10Row)
+  - Paging: Database와 커넥션을 맺은 후, PageSize 만큼 데이터 Read
+
+> 구현체
+
+- Cursor 기반 ItemReader 구현체
+  - JdbcCursorItemReader
+  - HibernateCursorItemReader
+  - StoredProcedureItemReader
+  - JpaCursorItemReader
+  
+- Paging 기반 ItemReader 구현체
+  - JdbcPagingItemReader
+  - HibernatePagingItemReader
+  - JpaPagingItemReader
+  
+## 7.3. CursorItemReader
+- Streaming 으로 데이터를 처리
+
+### 7.3.1. JdbcCursorItemReader
+
+- chunk
+  - <Pay, Pay> 에서 첫번째 Pay는 Reader에서 반환할 타입이며, 두번째 Pay는 Writer에 파라미터로 넘어올 타입
+  - chunkSize로 인자값을 넣은 경우는 Reader & Writer가 묶일 Chunk 트랜잭션 범위
+
+- fetchSize
+  - Database에서 한번에 가져올 데이터 양
+  - Paging은 실제 쿼리를 limit, offset을 이용해서 분할 처리하는 반면, Cursor는 쿼리는 분할 처리 없이 실행되나 내부적으로 가져오는 데이터는 FetchSize만큼 가져와 read()를 통해서 하나씩 가져옴
+
+- dataSource
+  - Database에 접근하기 위해 사용할 Datasource 객체를 할당
+  
+- rowMapper
+  - 쿼리 결과를 Java 인스턴스로 매핑하기 위한 Mapper
+  - 커스텀하게 생성해서 사용할 수 도 있지만, 이렇게 될 경우 매번 Mapper 클래스를 생성해야 되서 보편적으로는 Spring에서 공식적으로 지원하는 BeanPropertyRowMapper.class를 사용
+  
+- sql
+  - Reader로 사용할 쿼리문
+  
+- name
+  - reader의 이름을 지정
+  - Bean의 이름이 아니며 Spring Batch의 ExecutionContext에서 저장되어질 이름
+
+```java
+@ToString
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Entity
+public class Pay {
+  private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd hh:mm:ss");
+
+  @Id
+  @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+  private Long amount;
+  private String txName;
+  private LocalDateTime txDateTime;
+
+  public Pay(Long amount, String txName, String txDateTime) {
+    this.amount = amount;
+    this.txName = txName;
+    this.txDateTime = LocalDateTime.parse(txDateTime, FORMATTER);
+  }
+}
+
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class JdbcCursorItemReaderJobConfiguration {
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final DataSource dataSource; // DataSource DI
+
+  private static final int chunkSize = 10;
+
+  @Bean
+  public Job jdbcCursorItemReaderJob() {
+    return jobBuilderFactory.get("jdbcCursorItemReaderJob")
+        .start(jdbcCursorItemReaderStep())
+        .build();
+  }
+
+  @Bean
+  public Step jdbcCursorItemReaderStep() {
+    return stepBuilderFactory.get("jdbcCursorItemReaderStep")
+        .<Pay, Pay>chunk(chunkSize)
+        .reader(jdbcCursorItemReader())
+        .writer(jdbcCursorItemWriter())
+        .build();
+  }
+
+  @Bean
+  public JdbcCursorItemReader<Pay> jdbcCursorItemReader() {
+    return new JdbcCursorItemReaderBuilder<Pay>()
+        .fetchSize(chunkSize)
+        .dataSource(dataSource)
+        .rowMapper(new BeanPropertyRowMapper<>(Pay.class))
+        .sql("SELECT id, amount, tx_name, tx_date_time FROM pay")
+        .name("jdbcCursorItemReader")
+        .build();
+  }
+
+  private ItemWriter<Pay> jdbcCursorItemWriter() {
+    return list -> {
+      for (Pay pay: list) {
+        log.info("Current Pay={}", pay);
+      }
+    };
+  }
+}
+```
+
+> 결과
+```text
+Current Pay=Pay(id=1, amount=1000, txName=trade1, txDateTime=2018-09-10T00:00)
+Current Pay=Pay(id=2, amount=2000, txName=trade2, txDateTime=2018-09-10T00:00)
+Current Pay=Pay(id=3, amount=3000, txName=trade3, txDateTime=2018-09-10T00:00)
+Current Pay=Pay(id=4, amount=4000, txName=trade4, txDateTime=2018-09-10T00:00)
+```
+
+> 주의사항
+- CursorItemReader를 사용하실때는 Database와 SocketTimeout을 충분히 큰 값으로 설정
+- Cursor는 하나의 Connection으로 Batch가 끝날때까지 사용되기 때문에 Batch가 끝나기전에 Database와 어플리케이션의 Connection이 먼저 끊어질수 있음
+
+## 7.4. PagingItemReader
+- Paging: Database Cursor를 사용하는 대신 여러 쿼리를 실행하여 각 쿼리가 결과의 일부를 가져 오는 방법
+- Spring Batch에서는 offset과 limit을 PageSize에 맞게 자동으로 생성
+
+### 7.4.1. JdbcPagingItemReader
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class JdbcPagingItemReaderJobConfiguration {
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final DataSource dataSource; // DataSource DI
+
+  private static final int chunkSize = 10;
+
+  @Bean
+  public Job jdbcPagingItemReaderJob() throws Exception {
+    return jobBuilderFactory.get("jdbcPagingItemReaderJob")
+        .start(jdbcPagingItemReaderStep())
+        .build();
+  }
+
+  @Bean
+  public Step jdbcPagingItemReaderStep() throws Exception {
+    return stepBuilderFactory.get("jdbcPagingItemReaderStep")
+        .<Pay, Pay>chunk(chunkSize)
+        .reader(jdbcPagingItemReader())
+        .writer(jdbcPagingItemWriter())
+        .build();
+  }
+
+  @Bean
+  public JdbcPagingItemReader<Pay> jdbcPagingItemReader() throws Exception {
+    Map<String, Object> parameterValues = new HashMap<>();
+    parameterValues.put("amount", 2000);
+
+    return new JdbcPagingItemReaderBuilder<Pay>()
+        .pageSize(chunkSize)
+        .fetchSize(chunkSize)
+        .dataSource(dataSource)
+        .rowMapper(new BeanPropertyRowMapper<>(Pay.class))
+        .queryProvider(createQueryProvider())
+        .parameterValues(parameterValues)
+        .name("jdbcPagingItemReader")
+        .build();
+  }
+
+  private ItemWriter<Pay> jdbcPagingItemWriter() {
+    return list -> {
+      for (Pay pay: list) {
+        log.info("Current Pay={}", pay);
+      }
+    };
+  }
+
+  @Bean
+  public PagingQueryProvider createQueryProvider() throws Exception {
+    SqlPagingQueryProviderFactoryBean queryProvider = new SqlPagingQueryProviderFactoryBean();
+    queryProvider.setDataSource(dataSource); // Database에 맞는 PagingQueryProvider를 선택하기 위해
+    queryProvider.setSelectClause("id, amount, tx_name, tx_date_time");
+    queryProvider.setFromClause("from pay");
+    queryProvider.setWhereClause("where amount >= :amount");
+
+    Map<String, Order> sortKeys = new HashMap<>(1);
+    sortKeys.put("id", Order.ASCENDING);
+
+    queryProvider.setSortKeys(sortKeys);
+
+    return queryProvider.getObject();
+  }
+}
+```
+
+> Database Paging Provider
+[ SqlPagingQueryProviderFactoryBean Class ]
+- Db2PagingQueryProvider
+- Db2PagingQueryProvider
+- Db2PagingQueryProvider
+- Db2PagingQueryProvider
+- DerbyPagingQueryProvider
+- HsqlPagingQueryProvider
+- H2PagingQueryProvider
+- MySqlPagingQueryProvider
+- OraclePagingQueryProvider
+- PostgresPagingQueryProvider
+- SqlitePagingQueryProvider
+- SqlServerPagingQueryProvider
+- SybasePagingQueryProvider
+
+> Parameter 사용
+- 쿼리에 대한 매개 변수 값의 Map을 지정
+- queryProvider.setWhereClause을 사용하여 Parameter 사용
+
+```java
+@Bean
+public JdbcPagingItemReader<Pay> jdbcPagingItemReader() throws Exception {
+  Map<String, Object> parameterValues = new HashMap<>();
+  parameterValues.put("amount", 2000);
+  .....
+}
+
+@Bean
+public PagingQueryProvider createQueryProvider() throws Exception {
+  .....
+  queryProvider.setWhereClause("where amount >= :amount");
+  .....
+}
+```
+
+### 7.4.2. JpaPagingItemReader
+- JPA에는 Cursor 기반 Database 접근을 지원하지 않음
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class JpaPagingItemReaderJobConfiguration {
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final EntityManagerFactory entityManagerFactory;
+
+  private int chunkSize = 10;
+
+  @Bean
+  public Job jpaPagingItemReaderJob() {
+    return jobBuilderFactory.get("jpaPagingItemReaderJob")
+        .start(jpaPagingItemReaderStep())
+        .build();
+  }
+
+  @Bean
+  public Step jpaPagingItemReaderStep() {
+    return stepBuilderFactory.get("jpaPagingItemReaderStep")
+        .<Pay, Pay>chunk(chunkSize)
+        .reader(jpaPagingItemReader())
+        .writer(jpaPagingItemWriter())
+        .build();
+  }
+
+  @Bean
+  public JpaPagingItemReader<Pay> jpaPagingItemReader() {
+    return new JpaPagingItemReaderBuilder<Pay>()
+        .name("jpaPagingItemReader")
+        .entityManagerFactory(entityManagerFactory)
+        .pageSize(chunkSize)
+        .queryString("SELECT p FROM Pay p WHERE amount >= 2000")
+        .build();
+  }
+
+  private ItemWriter<Pay> jpaPagingItemWriter() {
+    return list -> {
+      for (Pay pay: list) {
+        log.info("Current Pay={}", pay);
+      }
+    };
+  }
+}
+```
+
+### 7.4.3. PagingItemReader 주의 사항
+- 정렬 (Order) 가 무조건 포함되어 있어야함
+
+## 7.5. ItemReader 주의 사항
+- JpaRepository를 ListItemReader, QueueItemReader에 사용하면 안됨
+  - Spring Batch의 장점인 페이징 & Cursor 구현이 없어 대규모 데이터 처리가 불가능 ( hunk 단위 트랜잭션은 가능)
+  - JpaRepository를 사용할 경우 RepositoryItemReader를 사용
+- Hibernate, JPA 등 영속성 컨텍스트가 필요한 Reader 사용시 fetchSize와 ChunkSize는 같은 값을 유지
