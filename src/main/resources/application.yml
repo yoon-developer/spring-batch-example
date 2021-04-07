@@ -16,7 +16,7 @@ spring:
 
   batch:
     job:
-      names: ${job.name:jdbcCursorItemReaderJob}
+      names: ${job.name:jpaItemWriterJob}
     initialize-schema: always
 logging:
   level:

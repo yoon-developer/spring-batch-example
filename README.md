@@ -1341,3 +1341,381 @@ public class JpaPagingItemReaderJobConfiguration {
   - Spring Batch의 장점인 페이징 & Cursor 구현이 없어 대규모 데이터 처리가 불가능 ( hunk 단위 트랜잭션은 가능)
   - JpaRepository를 사용할 경우 RepositoryItemReader를 사용
 - Hibernate, JPA 등 영속성 컨텍스트가 필요한 Reader 사용시 fetchSize와 ChunkSize는 같은 값을 유지
+
+# 8. ItemWriter
+
+## 8.1. ItemWriter 설명
+- Spring Batch에서 사용하는 출력 기능
+- Item 을 List 형태로 받음
+
+```java
+public interface ItemWriter<T> {
+
+	/**
+	 * Process the supplied data element. Will not be called with any null items
+	 * in normal operation.
+	 *
+	 * @param items items to be written
+	 * @throws Exception if there are errors. The framework will catch the
+	 * exception and convert or rethrow it as appropriate.
+	 */
+	void write(List<? extends T> items) throws Exception;
+
+}
+```
+
+> ItemReader -> ItemProcessor -> ItemWriter
+- ItemReader를 통해 각 항목을 개별적으로 읽고 이를 처리하기 위해 ItemProcessor에 전달 (Chunk 의 Item 개수 만큼 처리)
+- ItemProcessor 에서 처리가 완료되면 Chunk 단위만큼 ItemWriter 에서 일괄 처리.
+
+## 8.2. Database Writer
+
+- JPA 사용시 wirte 부분의 영속성 관리를 위하여 flush 사용됨
+
+[ JpaItemWriter ]
+```java
+@Override
+public void write(List<? extends T> items) {
+	EntityManager entityManager = EntityManagerFactoryUtils.getTransactionalEntityManager(entityManagerFactory);
+	if (entityManager == null) {
+		throw new DataAccessResourceFailureException("Unable to obtain a transactional EntityManager");
+	}
+	doWrite(entityManager, items);
+	entityManager.flush();
+}
+```
+
+> Writer
+- JdbcBatchItemWriter
+- HibernateItemWriter
+- JpaItemWriter
+
+## 8.3. JdbcBatchItemWriter
+
+- JDBC의 Batch 기능을 사용하여 한번에 Database로 전달하여 Database 내부에서 쿼리들이 실행 (Database Connection 최적화)
+  - .batchUpdate(sql, items.toArray(new Map[items.size()]));
+  - .batchUpdate(sql, batchArgs);
+  - ps.addBatch();
+
+```java
+public void write(final List<? extends T> items) throws Exception {
+
+	if (!items.isEmpty()) {
+
+		if (logger.isDebugEnabled()) {
+			logger.debug("Executing batch with " + items.size() + " items.");
+		}
+
+		int[] updateCounts;
+
+		if (usingNamedParameters) {
+			if(items.get(0) instanceof Map && this.itemSqlParameterSourceProvider == null) {
+				updateCounts = namedParameterJdbcTemplate.batchUpdate(sql, items.toArray(new Map[items.size()]));
+			} else {
+				SqlParameterSource[] batchArgs = new SqlParameterSource[items.size()];
+				int i = 0;
+				for (T item : items) {
+					batchArgs[i++] = itemSqlParameterSourceProvider.createSqlParameterSource(item);
+				}
+				updateCounts = namedParameterJdbcTemplate.batchUpdate(sql, batchArgs);
+			}
+		}
+		else {
+			updateCounts = namedParameterJdbcTemplate.getJdbcOperations().execute(sql, new PreparedStatementCallback<int[]>() {
+				@Override
+				public int[] doInPreparedStatement(PreparedStatement ps) throws SQLException, DataAccessException {
+					for (T item : items) {
+						itemPreparedStatementSetter.setValues(item, ps);
+						ps.addBatch();
+					}
+					return ps.executeBatch();
+				}
+			});
+		}
+
+		if (assertUpdates) {
+			for (int i = 0; i < updateCounts.length; i++) {
+				int value = updateCounts[i];
+				if (value == 0) {
+					throw new EmptyResultDataAccessException("Item " + i + " of " + updateCounts.length
+							+ " did not update any rows: [" + items.get(i) + "]", 1);
+				}
+			}
+		}
+	}
+}
+```
+
+### 8.3.1. JdbcBatchItemWriter 예제코드
+
+- JdbcBatchItemWriter의 제네릭 타입은 Reader에서 넘겨주는 값의 타입
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class JdbcBatchItemWriterJobConfiguration {
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final DataSource dataSource;
+
+  private static final int chunkSize = 10;
+
+  @Bean
+  public Job jdbcBatchItemWriterJob() {
+
+    return jobBuilderFactory.get("jdbcBatchItemWriterJob")
+        .start(jdbcBatchItemWriterStep())
+        .build();
+
+  }
+
+  private Step jdbcBatchItemWriterStep() {
+    return stepBuilderFactory.get("jdbcBatchItemWriterStep")
+        .<Pay, Pay>chunk(chunkSize)
+        .reader(jdbcBatchItemWriterReader())
+        .writer(jdbcBatchItemWriter())
+        .build();
+  }
+
+  private JdbcBatchItemWriter<Pay> jdbcBatchItemWriter() {
+
+    JdbcBatchItemWriter<Pay> jdbcBatchItemWriterBuilder = new JdbcBatchItemWriterBuilder<Pay>()
+        .dataSource(dataSource)
+        .sql("INSERT INTO pay2(amount, tx_name, tx_date_time) VALUES(:amount, :txName, :txDateTime)")
+        .beanMapped()
+        .build();
+    
+    jdbcBatchItemWriterBuilder.afterPropertiesSet();;
+
+    return jdbcBatchItemWriterBuilder;
+  }
+
+  private JdbcCursorItemReader<Pay> jdbcBatchItemWriterReader() {
+    return new JdbcCursorItemReaderBuilder<Pay>()
+        .dataSource(dataSource)
+        .sql("SELECT id, amount, tx_name, tx_date_time FROM pay")
+        .name("jdbcBatchItemReader")
+        .build();
+  }
+
+}
+```
+
+|Property     |Parameter Type|설명                                                                                                             |
+|-------------|--------------|---------------------------------------------------------------------------------------------------------------|
+|assertUpdates|boolean       |적어도 하나의 항목이 행을 업데이트하거나 삭제하지 않을 경우 예외를 throw할지 여부를 설정. 기본값은 true. Exception:EmptyResultDataAccessException|
+|columnMapped |없음            |Key,Value 기반으로 Insert SQL의 Values를 매핑 (ex: Map<String, Object>)                                             |
+|beanMapped   |없음            |Pojo 기반으로 Insert SQL의 Values를 매핑  
+
+> columnMapped vs beanMapped
+- Reader에서 Writer로 넘겨주는 타입
+  - columnMapped: Map<String, Object>
+  - beanMapped: Pojo 타입
+
+### 8.3.2. afterPropertiesSet
+
+- Writer들이 실행되기 위해 필요한 필수값 확인 Method
+
+[ JdbcBatchItemWriter Class ]
+
+```java
+	@Override
+	public void afterPropertiesSet() {
+		Assert.notNull(namedParameterJdbcTemplate, "A DataSource or a NamedParameterJdbcTemplate is required.");
+		Assert.notNull(sql, "An SQL statement is required.");
+		List<String> namedParameters = new ArrayList<>();
+		parameterCount = JdbcParameterUtils.countParameterPlaceholders(sql, namedParameters);
+		if (namedParameters.size() > 0) {
+			if (parameterCount != namedParameters.size()) {
+				throw new InvalidDataAccessApiUsageException("You can't use both named parameters and classic \"?\" placeholders: " + sql);
+			}
+			usingNamedParameters = true;
+		}
+		if (!usingNamedParameters) {
+			Assert.notNull(itemPreparedStatementSetter, "Using SQL statement with '?' placeholders requires an ItemPreparedStatementSetter");
+		}
+	}
+```
+## 8.4. JpaItemWriter
+
+- JpaItemWriter는 JPA를 사용하기 때문에 영속성 관리를 위해 EntityManager를 할당
+- JpaItemWriter는 넘어온 Entity를 데이터베이스에 반영
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class JpaItemWriterJobConfiguration {
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final EntityManagerFactory entityManagerFactory;
+
+  private static final int chunkSize = 10;
+
+  @Bean
+  public Job jpaItemWriterJob() {
+    return jobBuilderFactory.get("jpaItemWriterJob")
+        .start(jpaItemWriterStep())
+        .build();
+  }
+
+  @Bean
+  public Step jpaItemWriterStep() {
+    return stepBuilderFactory.get("jpaItemWriterStep")
+        .<Pay, Pay2>chunk(chunkSize)
+        .reader(jpaItemWriterReader())
+        .processor(jpaItemProcessor())
+        .writer(jpaItemWriter())
+        .build();
+  }
+
+  @Bean
+  public JpaItemWriter<Pay2> jpaItemWriter() {
+    JpaItemWriter<Pay2> jpaItemWriter = new JpaItemWriter<>();
+    jpaItemWriter.setEntityManagerFactory(entityManagerFactory);
+    return jpaItemWriter;
+  }
+
+  @Bean
+  public ItemProcessor<Pay, Pay2> jpaItemProcessor() {
+    return pay -> new Pay2(pay.getAmount(), pay.getTxName(), pay.getTxDateTime());
+  }
+
+  @Bean
+  public JpaPagingItemReader<Pay> jpaItemWriterReader() {
+    return new JpaPagingItemReaderBuilder<Pay>()
+        .name("jpaItemWriterReader")
+        .entityManagerFactory(entityManagerFactory)
+        .pageSize(chunkSize)
+        .queryString("SELECT p FROM pay p")
+        .build();
+  }
+
+}
+```
+
+[ JpaItemWriter ]
+
+- EntityManager는 필수 설정
+
+```java
+@Override
+public void afterPropertiesSet() throws Exception {
+	Assert.notNull(entityManagerFactory, "An EntityManagerFactory is required");
+}
+```
+
+```text
+Hibernate: insert into pay2(id, amount, tx_date_time, tx_name) values(null, ?, ?, ?)
+Hibernate: insert into pay2(id, amount, tx_date_time, tx_name) values(null, ?, ?, ?)
+Hibernate: insert into pay2(id, amount, tx_date_time, tx_name) values(null, ?, ?, ?)
+Hibernate: insert into pay2(id, amount, tx_date_time, tx_name) values(null, ?, ?, ?)
+```
+
+
+
+[ JpaItemWriter Class ]
+
+- JpaItemWriter 는 넘어온 Item을 그대로 entityManger.merge()로 테이블에 반영
+
+```java
+@Override
+public void write(List<? extends T> items) {
+	EntityManager entityManager = EntityManagerFactoryUtils.getTransactionalEntityManager(entityManagerFactory);
+	if (entityManager == null) {
+		throw new DataAccessResourceFailureException("Unable to obtain a transactional EntityManager");
+	}
+	doWrite(entityManager, items);
+	entityManager.flush();
+}
+
+protected void doWrite(EntityManager entityManager, List<? extends T> items) {
+
+	if (logger.isDebugEnabled()) {
+		logger.debug("Writing to JPA with " + items.size() + " items.");
+	}
+
+	if (!items.isEmpty()) {
+		long addedToContextCount = 0;
+		for (T item : items) {
+			if (!entityManager.contains(item)) {
+				if(usePersist) {
+					entityManager.persist(item);
+				}
+				else {
+					entityManager.merge(item);
+				}					
+				addedToContextCount++;
+			}
+		}
+		if (logger.isDebugEnabled()) {
+			logger.debug(addedToContextCount + " entities " + (usePersist ? " persisted." : "merged."));
+			logger.debug((items.size() - addedToContextCount) + " entities found in persistence context.");
+		}
+	}
+}
+```
+## 8.5. Custom ItemWriter
+
+- Spring Batch에서 공식적으로 지원하지 않는 Writer를 사용하고 싶을때 ItemWriter인터페이스를 구현
+- ItemWriter 에서 write() override 하여 구현
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class CustomItemWriterJobConfiguration {
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final EntityManagerFactory entityManagerFactory;
+
+  private static final int chunkSize = 10;
+
+  @Bean
+  public Job customItemWriterJob() {
+    return jobBuilderFactory.get("customItemWriterJob")
+        .start(customItemWriterStep())
+        .build();
+  }
+
+  @Bean
+  public Step customItemWriterStep() {
+    return stepBuilderFactory.get("customItemWriterStep")
+        .<Pay, Pay2>chunk(chunkSize)
+        .reader(customItemWriterReader())
+        .processor(customItemWriterProcessor())
+        .writer(customItemWriter())
+        .build();
+  }
+
+  @Bean
+  public JpaPagingItemReader<Pay> customItemWriterReader() {
+    return new JpaPagingItemReaderBuilder<Pay>()
+        .name("customItemWriterReader")
+        .entityManagerFactory(entityManagerFactory)
+        .pageSize(chunkSize)
+        .queryString("SELECT p FROM Pay p")
+        .build();
+  }
+
+  @Bean
+  public ItemProcessor<Pay, Pay2> customItemWriterProcessor() {
+    return pay -> new Pay2(pay.getAmount(), pay.getTxName(), pay.getTxDateTime());
+  }
+
+  @Bean
+  public ItemWriter<Pay2> customItemWriter() {
+    return new ItemWriter<Pay2>() {
+      @Override
+      public void write(List<? extends Pay2> items) throws Exception {
+        for (Pay2 item : items) {
+          System.out.println(item);
+        }
+      }
+    };
+  }
+}
+```
