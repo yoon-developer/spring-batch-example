@@ -1719,3 +1719,210 @@ public class CustomItemWriterJobConfiguration {
   }
 }
 ```
+
+# 9. ItemProcessor
+
+- ItemProcessor는 필수 X
+- ItemProcessor 사용이유: Reader, Writer에 비지니스 코드가 섞이는 것을 방지
+
+## 9.1. ItemProcessor 설명
+
+- 변환
+  - Reader에서 읽은 데이터를 원하는 타입으로 변환해서 Writer에 전달
+- 필터
+  - Reader에서 넘겨준 데이터를 Writer로 넘겨줄 것인지를 결정
+  - null을 반환하면 Writer에 전달되지 않음
+  
+```java
+public interface ItemProcessor<I, O> {
+
+	@Nullable
+	O process(@NonNull I item) throws Exception;
+}
+```
+
+> Generic Type
+- I: ItemReader에서 받은 데이터 타입
+- O: IteamWriter에 보낼 데이터 타입
+
+> Lambda
+- 장점
+  - 불필요한 코드 가 없어 구현 코드 양이 적음
+  - 고정된 형태가 없어 원하는 형태의 처리도 가능
+- 단점
+  - Batch Config 클래스 안에 포함되어 있어야만 해서 Batch Config의 코드 양이 많아질 수 있음
+  
+## 9.2. 변환
+
+> 예제 코드
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class ProcessorConvertJobConfiguration {
+
+  public static final String JOB_NAME = "ProcessorConvertBatch";
+  public static final String BEAN_PREFIX = JOB_NAME + "_";
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final EntityManagerFactory emf;
+
+  @Value("${chunkSize:1000}")
+  private int chunkSize;
+
+  @Bean(JOB_NAME)
+  public Job job() {
+
+    return jobBuilderFactory.get(JOB_NAME)
+        .preventRestart()
+        .start(step())
+        .build();
+
+  }
+
+  @Bean(BEAN_PREFIX + "step")
+  public Step step() {
+    return stepBuilderFactory.get(BEAN_PREFIX + "step")
+        .<Pay, String>chunk(chunkSize)
+        .reader(reader())
+        .processor(processor())
+        .writer(writer())
+        .build();
+  }
+
+  private ItemWriter<String> writer() {
+    return items -> {
+      for (String item : items) {
+        log.info("Pay Tx Name: " + item);
+      }
+    };
+  }
+
+  private ItemProcessor<Pay, String> processor() {
+    return pay -> pay.getTxName();
+  }
+
+  private JpaPagingItemReader<Pay> reader() {
+    return new JpaPagingItemReaderBuilder<Pay>()
+        .name(BEAN_PREFIX + "reader")
+        .entityManagerFactory(emf)
+        .pageSize(chunkSize)
+        .queryString("SELECT p FROM Pay p")
+        .build();
+  }
+
+}
+```
+
+- <Pay, String>
+  - Pay: Reader에서 읽어올 타입
+  - String: Writer에 넘겨줄 타입
+  
+- <Pay, String>chunk(chunkSize)
+  - Pay: Reader 타입
+  - String: Writer 타입 
+  
+```text
+@Bean
+public ItemProcessor<Pay, String> processor() {
+    return teacher -> {
+        return teacher.getName();
+    };
+}
+
+@Bean(BEAN_PREFIX + "step")
+public Step step() {
+  return stepBuilderFactory.get(BEAN_PREFIX + "step")
+      .<Pay, String>chunk(chunkSize)
+      .reader(reader())
+      .processor(processor())
+      .writer(writer())
+      .build();
+}
+```
+
+```text
+INFO 15711 --- [  restartedMain] c.s.b.j.ProcessorConvertJobConfiguration : Pay Tx Name: trade1
+INFO 15711 --- [  restartedMain] c.s.b.j.ProcessorConvertJobConfiguration : Pay Tx Name: trade2
+INFO 15711 --- [  restartedMain] c.s.b.j.ProcessorConvertJobConfiguration : Pay Tx Name: trade3
+INFO 15711 --- [  restartedMain] c.s.b.j.ProcessorConvertJobConfiguration : Pay Tx Name: trade4
+```
+## 9.3. 필터
+ Writer에 값을 넘길지 말지를 Processor에서 판단하는 것
+
+```java
+@Slf4j
+@RequiredArgsConstructor
+@Configuration
+public class ProcessorNullJobConfiguration {
+
+  public static final String JOB_NAME = "processorNullBatch";
+  public static final String BEAN_PREFIX = JOB_NAME + "_";
+
+  private final JobBuilderFactory jobBuilderFactory;
+  private final StepBuilderFactory stepBuilderFactory;
+  private final EntityManagerFactory emf;
+
+
+  @Value("${chunkSize:1000}")
+  private int chunkSize;
+
+
+  @Bean(JOB_NAME)
+  public Job job() {
+    return jobBuilderFactory.get(JOB_NAME)
+        .preventRestart()
+        .start(step())
+        .build();
+  }
+
+  @Bean(BEAN_PREFIX + "step")
+  public Step step() {
+    return stepBuilderFactory.get(BEAN_PREFIX + "step")
+        .<Pay, Pay>chunk(chunkSize)
+        .reader(reader())
+        .processor(processor())
+        .writer(writer())
+        .build();
+  }
+
+  private ItemWriter<Pay> writer() {
+
+    return items -> {
+      for (Pay item : items) {
+        log.info("Pay Tx Name={}", item.getTxName());
+      }
+    };
+  }
+
+  private ItemProcessor<Pay, Pay> processor() {
+    return pay -> {
+
+      boolean isIgnoreTarget = pay.getId() % 2 == 0L;
+      if (isIgnoreTarget) {
+        log.info(">>>>> Pay Tx Name={},  isIgnoreTarget={}", pay.getTxName(), isIgnoreTarget);
+        return null;
+      }
+      return pay;
+    };
+  }
+
+  private JpaPagingItemReader<Pay> reader() {
+    return new JpaPagingItemReaderBuilder<Pay>()
+        .name(BEAN_PREFIX + "reader")
+        .pageSize(chunkSize)
+        .entityManagerFactory(emf)
+        .queryString("SELECT p FROM Pay p")
+        .build();
+  }
+
+}
+```
+
+```text
+INFO 29642 --- [  restartedMain] c.s.b.job.ProcessorNullJobConfiguration  : >>>>> Pay Tx Name=trade2,  isIgnoreTarget=true
+INFO 29642 --- [  restartedMain] c.s.b.job.ProcessorNullJobConfiguration  : >>>>> Pay Tx Name=trade4,  isIgnoreTarget=true
+INFO 29642 --- [  restartedMain] c.s.b.job.ProcessorNullJobConfiguration  : Pay Tx Name=trade1
+INFO 29642 --- [  restartedMain] c.s.b.job.ProcessorNullJobConfiguration  : Pay Tx Name=trade3
+```

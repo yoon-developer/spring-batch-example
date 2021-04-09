@@ -16,7 +16,7 @@ spring:
 
   batch:
     job:
-      names: ${job.name:jpaItemWriterJob}
+      names: ${job.name:processorNullBatch}
     initialize-schema: always
 logging:
   level:
